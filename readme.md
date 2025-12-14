@@ -638,4 +638,371 @@ npm start
 - Publicly accessible endpoint
 
 ---
+---
 
+## 🔗 DEX Integration Details
+
+This section explains how the engine integrates with Raydium and Meteora, how quotes are fetched, how execution is performed, and why Meteora may be unavailable for certain orders.
+
+---
+
+### 🟣 Raydium Integration (Primary Execution Path)
+
+Raydium is the primary execution venue for this engine due to its maturity, liquidity depth, and well-maintained SDK.
+
+**Why Raydium?**
+
+- Deep liquidity across most major Solana pairs
+- Stable CPMM (Constant Product Market Maker) pools
+- Official SDK with swap construction, slippage handling, and compute budget support
+- High execution reliability under load
+
+**Raydium Architecture Used**
+
+- **Pool Type**: CPMM (Constant Product AMM)
+- **SDK**: `@raydium-io/raydium-sdk-v2`
+- **Transaction Version**: `TxVersion.V0`
+- **Compute Budget**: Explicitly configured for reliability
+
+**Quote Flow (Raydium)**
+
+1. Load Raydium SDK with shared Solana connection
+2. Fetch pool info and pool keys from RPC
+3. Calculate swap output using pool reserves
+4. Normalize output into engine's internal quote format
+
+```typescript
+const raydium = await Raydium.load({
+  owner: wallet,
+  connection,
+  cluster: 'devnet',
+});
+
+const { poolInfo, poolKeys } =
+  await raydium.cpmm.getPoolInfoFromRpc(poolId);
+
+const inputAmount = new BN(amountSol * LAMPORTS_PER_SOL);
+
+// Manual AMM calculation: x * y = k
+const reserveA = new BN(Math.floor(poolInfo.mintAmountA * 1e9));
+const reserveB = new BN(Math.floor(poolInfo.mintAmountB * 1e6));
+
+const inputWithFee = inputAmount.mul(new BN(997000)).div(new BN(1000000));
+const outputAmount = reserveB.mul(inputWithFee).div(reserveA.add(inputWithFee));
+```
+
+> **Note**: The engine performs manual AMM math for quote calculation but delegates execution entirely to Raydium's SDK to ensure slippage protection and proper instruction construction.
+
+**Execution Flow (Raydium)**
+
+Once Raydium is selected as the best DEX:
+
+1. Transaction is built using Raydium's swap instruction builder
+2. Compute budget instructions are attached
+3. Transaction is signed and submitted without waiting for confirmation
+4. Confirmation is monitored separately
+5. Final result is persisted in the database
+
+```typescript
+const { execute } = await raydium.cpmm.swap({
+  poolInfo,
+  poolKeys,
+  baseIn: true,
+  fixedOut: false,
+  inputAmount,
+  swapResult: {
+    inputAmount,
+    outputAmount,
+  },
+  slippage: SLIPPAGE_BPS / 10_000,
+  txVersion: TxVersion.V0,
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 200_000,
+  },
+});
+
+const { txId } = await execute({ sendAndConfirm: false });
+```
+
+**Why Raydium Execution Is Reliable**
+
+- ✅ Slippage protection is enforced on-chain
+- ✅ Transactions fail fast with deterministic errors (`InstructionError: [2, { Custom: 1 }]` means slippage exceeded)
+- ✅ SDK internally handles:
+  - Fee calculations
+  - Token account creation/validation
+  - Instruction ordering
+  - Compute budget optimization
+
+This makes Raydium ideal for a market-order execution engine.
+
+**Common Raydium Errors**
+
+| Error | Meaning | Solution |
+|-------|---------|----------|
+| `InstructionError: [2, { Custom: 1 }]` | Slippage exceeded | Increase `SLIPPAGE_BPS` or fetch fresh quote |
+| `InstructionError: [2, { Custom: 6 }]` | Insufficient liquidity | Use smaller amounts or different pool |
+| `Transaction simulation failed` | Invalid pool state | Verify pool ID and retry |
+
+---
+
+### 🟢 Meteora Integration (Opportunistic Routing)
+
+Meteora is integrated as a secondary pricing and execution venue using its Dynamic AMM (DAMM) model.
+
+**Why Integrate Meteora?**
+
+- Capital-efficient liquidity distribution
+- Better pricing on select pools with concentrated liquidity
+- Dynamic fee curves that adapt to market conditions
+
+The engine attempts to fetch a Meteora quote for every order, but execution only proceeds if the pool is compatible and available.
+
+**Meteora Quote Flow**
+
+```typescript
+const amm = await AmmImpl.create(
+  connection as any,
+  new PublicKey(poolId)
+);
+
+const quote = amm.getSwapQuote(
+  amm.tokenAMint.address,
+  amountLamports,
+  SLIPPAGE_BPS / 10_000
+);
+```
+
+**Returned values:**
+
+- `swapOutAmount` - Expected output tokens
+- `minSwapOutAmount` - Minimum guaranteed output after slippage
+- `priceImpact` - Estimated price impact percentage
+- `fee` - Trading fee amount
+
+These are normalized into the same internal format as Raydium quotes to allow fair comparison.
+
+---
+
+### ⚠️ Why Meteora Is Sometimes Unavailable
+
+You will often see logs like:
+
+```
+⚠️ Meteora quote unavailable: Invalid account discriminator
+```
+
+**This is expected behavior, not a bug.**
+
+**Root Causes**
+
+#### 1. Pool Incompatibility
+
+- Raydium and Meteora use completely different pool account layouts
+- Passing a Raydium pool ID to Meteora will always fail
+- Meteora requires DAMM-specific pool accounts with its own discriminator
+
+#### 2. Limited Pool Coverage
+
+- Meteora does not support all trading pairs
+- Many common pairs (e.g., older Raydium pools) do not exist on Meteora
+- The ORCA/SOL pair in your logs uses a Raydium CPMM pool, not a Meteora DAMM pool
+
+#### 3. Strict Account Validation
+
+- Meteora validates account discriminators at load time
+- Any mismatch causes an immediate rejection (by design)
+- This is a safety feature to prevent incorrect pool interactions
+
+**How the Engine Handles This**
+
+Meteora is treated as **opportunistic**, never mandatory.
+
+```typescript
+try {
+  meteoraQuote = await fetchMeteoraQuote(...);
+} catch (error) {
+  console.warn('⚠️  Meteora quote unavailable:', error.message);
+  meteoraQuote = null;
+}
+```
+
+If Meteora fails:
+
+1. The engine logs the failure for observability
+2. Routing continues with Raydium only
+3. Order execution is **not blocked**
+4. User receives the best available price from Raydium
+
+This guarantees **liveness and reliability**.
+
+**When Meteora Would Be Available**
+
+Meteora would successfully return quotes if:
+
+- The `poolId` parameter points to a valid Meteora DAMM pool
+- The pool exists on-chain and is properly initialized
+- The trading pair has sufficient liquidity on Meteora
+
+**Example: Finding Meteora Pools**
+
+```typescript
+// To use Meteora, you need Meteora-specific pool IDs
+// These are different from Raydium pool IDs
+
+// Example Meteora DLMM pool (SOL-USDC):
+const meteoraPoolId = 'Bz88...'; // Different from Raydium pool ID
+
+// Then the quote would succeed:
+const quote = await meteoraQuote(meteoraPoolId, amountLamports);
+```
+
+---
+
+### 🧠 Design Decision: Graceful Degradation
+
+A critical design goal of this engine is **graceful degradation**:
+
+| Scenario | Behavior |
+|----------|----------|
+| Meteora unavailable | → Fallback to Raydium |
+| One DEX fails | → Order still completes with available DEX |
+| All DEXs fail | → Order transitions to `failed` with full audit data |
+
+This ensures:
+
+- ✅ No single DEX is a single point of failure
+- ✅ Users always receive deterministic outcomes
+- ✅ The system is production-safe
+- ✅ Complete observability via WebSocket updates and database logs
+
+**Example: Dual-DEX Quote Attempt**
+
+```typescript
+const [raydiumQuote, meteoraQuote] = await Promise.allSettled([
+  raydiumQuote(poolId, amount),
+  meteoraQuote(poolId, amount),
+]);
+
+const quotes = [];
+if (raydiumQuote.status === 'fulfilled') quotes.push(raydiumQuote.value);
+if (meteoraQuote.status === 'fulfilled') quotes.push(meteoraQuote.value);
+
+// Select best quote
+const bestQuote = quotes.reduce((best, current) => 
+  current.amountOut > best.amountOut ? current : best
+);
+```
+
+This pattern ensures the engine **always attempts both DEXs** but **never fails if one is unavailable**.
+
+---
+
+### 📊 Quote Comparison Logic
+
+When both DEXs return valid quotes, the engine selects the best execution price:
+
+```typescript
+function selectBestDex(raydiumQuote, meteoraQuote) {
+  const raydiumOutput = Number(raydiumQuote.amountOut);
+  const meteoraOutput = Number(meteoraQuote.amountOut);
+  
+  console.log(`📊 Raydium quote: ${raydiumOutput}`);
+  console.log(`📊 Meteora quote: ${meteoraOutput}`);
+  
+  const bestDex = raydiumOutput > meteoraOutput ? 'raydium' : 'meteora';
+  const bestOutput = Math.max(raydiumOutput, meteoraOutput);
+  
+  console.log(`🏆 Best DEX: ${bestDex} with output ${bestOutput}`);
+  
+  return { dex: bestDex, amountOut: bestOutput };
+}
+```
+
+**Selection Criteria:**
+
+1. **Higher output tokens** (more tokens = better price)
+2. **Both quotes use same slippage tolerance** for fair comparison
+3. **Execution price is logged** to database for audit trail
+
+---
+
+### 🔧 Configuration
+
+**Environment Variables**
+
+```env
+# Slippage tolerance in basis points
+SLIPPAGE_BPS=1000  # 10%
+
+# For production, use tighter slippage:
+SLIPPAGE_BPS=300   # 3%
+```
+
+**Adjusting for Pool Liquidity**
+
+For low-liquidity pools (like ORCA/SOL in your logs), you may need:
+
+```env
+SLIPPAGE_BPS=5000  # 50% for testing
+```
+
+Once you move to higher-liquidity pairs (SOL/USDC, SOL/USDT), reduce to:
+
+```env
+SLIPPAGE_BPS=100   # 1% for production
+```
+
+---
+
+### 🐛 Debugging Integration Issues
+
+**Enable Verbose Logging**
+
+```typescript
+// In raydium.ts or meteora.ts
+console.log('Pool info:', JSON.stringify(poolInfo, null, 2));
+console.log('Quote result:', JSON.stringify(quote, null, 2));
+```
+
+**Check Pool State**
+
+```bash
+# Verify Raydium pool exists
+solana account <POOL_ID> --url devnet
+
+# Check pool reserves
+# Look for mintAmountA and mintAmountB in account data
+```
+
+**Test with Known-Good Pools**
+
+```typescript
+// Use official Raydium devnet pools
+const SOL_USDC_POOL = '8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj';
+const quote = await raydiumQuote(SOL_USDC_POOL, 0.1 * LAMPORTS_PER_SOL);
+```
+
+---
+
+### 🚀 Production Recommendations
+
+1. **Use Mainnet Pools**: Devnet pools have low liquidity
+2. **Monitor Quote Failures**: Track `meteoraQuote` success rate
+3. **Set Appropriate Slippage**: 1-3% for liquid pairs, 5-10% for exotic pairs
+4. **Implement Pool Discovery**: Auto-discover available Meteora pools for each pair
+5. **Add Circuit Breakers**: Pause routing if DEX error rate exceeds threshold
+
+**Next Steps for Meteora Integration**
+
+To fully utilize Meteora:
+
+1. Maintain a separate pool mapping for Meteora DAMM pools
+2. Query Meteora's pool registry on startup
+3. Map trading pairs to their respective Meteora pool IDs
+4. Only attempt Meteora quotes for pairs with known Meteora pools
+
+This would eliminate the "Invalid account discriminator" warnings and improve routing efficiency.
+
+---

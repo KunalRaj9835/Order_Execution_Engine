@@ -1,139 +1,336 @@
+import { connection } from '../dex/solana.js';
 import { Worker } from 'bullmq';
-import { Redis } from 'ioredis';
-import { DexRouter } from '../dex/dex.router.js';
+import { redisConnection } from './redis.js';
+import { chooseBest } from '../dex/router.js';
+import { raydiumQuote, raydiumExecute } from '../dex/raydium.adapter.js';
+import { meteoraQuote } from '../dex/meteora.adapter.js';
 import { sendUpdate } from '../websocket/ws.manager.js';
-import { orderService } from '../db/order.service.js';
-import { sleep } from '../utils/sleep.js';
+import { withTimeout } from '../utils/withTimeout.js';
+import { supabase } from '../db/supabase.js';
 
-const connection = new Redis({
-  maxRetriesPerRequest: null,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
-});
-const dexRouter = new DexRouter();
-
-const worker = new Worker(
+export const orderWorker = new Worker(
   'orders',
-  async (job) => {
-    const { orderId, tokenName, amount } = job.data;
+  async job => {
+    const { orderId, amount } = job.data;
 
-    try {
-      console.log(`\n🔄 Processing order ${orderId} for ${tokenName}`);
-      
-      // Stage 1: PENDING (already created in route)
-      sendUpdate(orderId, { 
-        status: 'pending',
-        orderId,
-        tokenName,
-        amount 
-      });
-      await sleep(500);
-
-      // Stage 2: ROUTING - Compare DEX prices
-      console.log(`📡 Routing order ${orderId}...`);
-      sendUpdate(orderId, { status: 'routing' });
-      await orderService.updateOrderStatus(orderId, 'routing');
-      
-      const bestDex = await dexRouter.route(tokenName, amount);
-      
-      // Update database with prices
-      await orderService.updateOrderPrices(
-        orderId,
-        bestDex.raydiumPrice,
-        bestDex.meteoraPrice,
-        bestDex.dex
-      );
-
-      // Stage 3: BUILDING - Creating transaction
-      console.log(`🔨 Building transaction for order ${orderId} on ${bestDex.dex}...`);
-      sendUpdate(orderId, {
-        status: 'building',
-        dex: bestDex.dex,
-        raydiumPrice: bestDex.raydiumPrice,
-        meteoraPrice: bestDex.meteoraPrice,
-        chosenPrice: bestDex.price,
-        priceDifference: bestDex.priceDifference,
-        priceDifferencePercent: bestDex.priceDifferencePercent,
-      });
-      await orderService.updateOrderStatus(orderId, 'building', {
-        dex: bestDex.dex,
-        price: bestDex.price,
-      });
-      await sleep(1000);
-
-      // Stage 4: SUBMITTED - Transaction sent to network
-      console.log(`📤 Submitting transaction for order ${orderId}...`);
-      sendUpdate(orderId, { status: 'submitted' });
-      await orderService.updateOrderStatus(orderId, 'submitted');
-      await sleep(1500);
-
-      // Stage 5: CONFIRMED - Transaction successful
-      const txHash = `tx_${Math.random().toString(36).slice(2, 15)}`;
-      const executionPrice = bestDex.effectivePrice;
-      
-      console.log(`✅ Order ${orderId} confirmed!`);
-      console.log(`   Token: ${tokenName}`);
-      console.log(`   DEX: ${bestDex.dex}`);
-      console.log(`   Price: $${executionPrice}`);
-      console.log(`   TX: ${txHash}\n`);
-
-      // Save transaction to database
-      await orderService.createTransaction(
-        orderId,
-        bestDex.dex,
-        executionPrice,
-        txHash
-      );
-
-      sendUpdate(orderId, {
-        status: 'confirmed',
-        txHash,
-        executionPrice,
-        dex: bestDex.dex,
-      });
-
-      return { 
-        success: true, 
-        txHash, 
-        executionPrice,
-        dex: bestDex.dex 
-      };
-      
-    } catch (error) {
-      console.error(`❌ Order ${orderId} failed:`, error);
-      
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      
-      // Mark order as failed in database
-      await orderService.markOrderFailed(orderId, errorMessage);
-      
-      sendUpdate(orderId, {
-        status: 'failed',
-        error: errorMessage,
-      });
-      
-      throw error;
+    console.log(`\n🔄 Processing order ${orderId}`);
+    
+    // Update database: routing
+    const { error: routingError } = await supabase
+      .from('orders')
+      .update({ status: 'routing' })
+      .eq('id', orderId);
+    
+    if (routingError) {
+      console.error('❌ Database update failed (routing):', routingError);
     }
+    
+    sendUpdate(orderId, { status: 'routing' });
+
+    const quotes = [];
+    let rayCtx;
+
+    // Get Raydium quote
+    try {
+      console.log('📊 Fetching Raydium quote...');
+      rayCtx = await withTimeout(
+        raydiumQuote(process.env.RAYDIUM_POOL_ID!, amount),
+        5000
+      );
+      quotes.push({
+        dex: 'raydium',
+        amountOut: rayCtx.amountOut,
+      });
+      console.log('✅ Raydium quote:', rayCtx.amountOut.toString());
+    } catch (e: any) {
+      console.error('❌ Raydium quote failed:', e.message);
+    }
+
+    // Get Meteora quote
+    try {
+      console.log('📊 Fetching Meteora quote...');
+      const met = await withTimeout(
+        meteoraQuote(process.env.METEORA_POOL_ID!, amount * 1e9),
+        5000
+      );
+      quotes.push(met);
+      console.log('✅ Meteora quote:', met.amountOut.toString());
+    } catch (e: any) {
+      console.warn('⚠️  Meteora quote unavailable:', e.message);
+    }
+
+    if (quotes.length === 0) {
+      const { error: failError } = await supabase
+        .from('orders')
+        .update({ 
+          status: 'failed'
+        })
+        .eq('id', orderId);
+      
+      if (failError) {
+        console.error('❌ Database update failed (no quotes):', failError);
+      }
+      
+      sendUpdate(orderId, { 
+        status: 'failed', 
+        error: 'No valid quotes from any DEX' 
+      });
+      
+      throw new Error('No valid quotes from any DEX');
+    }
+
+    const best = chooseBest(quotes);
+    console.log(`🏆 Best DEX: ${best.dex} with output ${best.amountOut}`);
+
+    // Calculate prices for both DEXs
+    const inputInBaseUnits = amount * 1e9;
+    const raydiumPrice = rayCtx ? Number(rayCtx.amountOut) / inputInBaseUnits : null;
+    const meteoraPrice = quotes.find(q => q.dex === 'meteora') 
+      ? Number(quotes.find(q => q.dex === 'meteora')!.amountOut) / inputInBaseUnits 
+      : null;
+    const executionPrice = Number(best.amountOut) / inputInBaseUnits;
+    
+    console.log(`💰 Execution price: ${executionPrice}`);
+
+    // Update database: building - USE CORRECT COLUMN NAMES
+    const { error: buildingError } = await supabase
+      .from('orders')
+      .update({ 
+        status: 'building',
+        chosen_dex: best.dex,           // ← Changed from 'dex'
+        raydium_price: raydiumPrice,    // ← Use raydium_price
+        meteora_price: meteoraPrice,    // ← Use meteora_price
+        execution_price: executionPrice // ← Use execution_price
+      })
+      .eq('id', orderId);
+    
+    if (buildingError) {
+      console.error('❌ Database update failed (building):', buildingError);
+    } else {
+      console.log('✅ Database updated: status=building, chosen_dex=', best.dex, 'execution_price=', executionPrice);
+    }
+
+    sendUpdate(orderId, {
+      status: 'building',
+      chosenDex: best.dex,
+      quotes,
+      price: executionPrice,
+    });
+
+    // Insert order event - USE CORRECT COLUMN NAMES
+    const { error: eventError } = await supabase
+      .from('order_events')
+      .insert({
+        order_id: orderId,
+        event: 'routing_complete',      // ← Changed from 'event_type'
+        metadata: {                      // ← Changed from 'data'
+          chosen_dex: best.dex,
+          quotes: quotes.map(q => ({
+            dex: q.dex,
+            amountOut: q.amountOut.toString()
+          })),
+          execution_price: executionPrice
+        }
+      });
+    
+    if (eventError) {
+      console.error('❌ Event insert failed (routing):', eventError);
+    }
+
+    if (best.dex !== 'raydium') {
+      await supabase
+        .from('orders')
+        .update({ status: 'failed' })
+        .eq('id', orderId);
+      
+      sendUpdate(orderId, { status: 'failed', error: 'Only Raydium execution supported' });
+      throw new Error('Only Raydium execution supported on devnet');
+    }
+
+    if (!rayCtx) {
+      await supabase
+        .from('orders')
+        .update({ status: 'failed' })
+        .eq('id', orderId);
+      
+      sendUpdate(orderId, { status: 'failed', error: 'Raydium context not available' });
+      throw new Error('Raydium context not available');
+    }
+
+    // Execute swap
+    console.log('🔁 Executing swap on Raydium...');
+    
+    let txHash: string;
+    try {
+      txHash = await withTimeout(
+        raydiumExecute(
+          rayCtx.poolInfo,
+          rayCtx.poolKeys,
+          rayCtx.inputAmount,
+          rayCtx.outputAmount
+        ),
+        20_000
+      );
+
+      console.log('✅ Transaction submitted:', txHash);
+
+      // Update database: submitted - NO tx_hash COLUMN, store in transactions table
+      const { error: submittedError } = await supabase
+        .from('orders')
+        .update({ status: 'submitted' })
+        .eq('id', orderId);
+      
+      if (submittedError) {
+        console.error('❌ Database update failed (submitted):', submittedError);
+      } else {
+        console.log('✅ Database updated: status=submitted');
+      }
+
+      // Insert into transactions table
+      const { error: txError } = await supabase
+        .from('transactions')
+        .insert({
+          order_id: orderId,
+          dex_used: best.dex,
+          execution_price: executionPrice,
+          tx_hash: txHash
+        });
+      
+      if (txError) {
+        console.error('❌ Transaction insert failed:', txError);
+      } else {
+        console.log('✅ Transaction record created:', txHash);
+      }
+
+      sendUpdate(orderId, {
+        status: 'submitted',
+        txHash,
+        dex: 'raydium',
+      });
+
+      // Insert order event
+      await supabase
+        .from('order_events')
+        .insert({
+          order_id: orderId,
+          event: 'transaction_submitted',
+          metadata: {
+            tx_hash: txHash,
+            dex: 'raydium'
+          }
+        });
+
+    } catch (execError: any) {
+      console.error('❌ Execution failed:', execError.message);
+      
+      await supabase
+        .from('orders')
+        .update({ status: 'failed' })
+        .eq('id', orderId);
+      
+      sendUpdate(orderId, { 
+        status: 'failed', 
+        error: execError.message 
+      });
+      
+      throw execError;
+    }
+
+    // Confirm transaction
+   // Confirm transaction
+console.log('⏳ Waiting for confirmation...');
+
+let tx;
+try {
+  // 1) Wait for the transaction to land (transport-level)
+  await withTimeout(
+    connection.confirmTransaction(txHash, 'confirmed'),
+    30_000
+  );
+
+  // 2) Fetch full transaction to inspect execution result
+  tx = await connection.getTransaction(txHash, {
+    commitment: 'confirmed',
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!tx) {
+    throw new Error('Transaction not found after confirmation');
+  }
+
+} catch (e) {
+  console.warn('⚠️ confirmTransaction timeout, fetching tx directly');
+
+  tx = await connection.getTransaction(txHash, {
+    commitment: 'confirmed',
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!tx) {
+    throw new Error('Transaction not found on-chain');
+  }
+}
+
+/**
+ * 🔴 CRITICAL RULE:
+ * - confirmed + meta.err !== null  => FAILED (reverted)
+ * - confirmed + meta.err === null  => SUCCESS
+ */
+if (tx.meta?.err) {
+  console.error('❌ Transaction reverted on-chain:', tx.meta.err);
+
+  await supabase
+    .from('orders')
+    .update({ status: 'failed' })
+    .eq('id', orderId);
+
+  await supabase.from('order_events').insert({
+    order_id: orderId,
+    event: 'execution_failed',
+    metadata: {
+      tx_hash: txHash,
+      error: tx.meta.err,
+    },
+  });
+
+  sendUpdate(orderId, {
+    status: 'failed',
+    txHash,
+    error: 'Swap reverted on-chain',
+  });
+
+  return { txHash };
+}
+
+// ✅ SUCCESS PATH (assets actually moved)
+await supabase
+  .from('orders')
+  .update({ status: 'success' })
+  .eq('id', orderId);
+
+await supabase.from('order_events').insert({
+  order_id: orderId,
+  event: 'transaction_success',
+  metadata: {
+    tx_hash: txHash,
+    dex: 'raydium',
+  },
+});
+
+sendUpdate(orderId, {
+  status: 'success',
+  txHash,
+  dex: 'raydium',
+});
+
+console.log('✅ Swap executed successfully');
+return { txHash };
+
   },
   {
-    connection,
-    concurrency: 10, // Handle up to 10 concurrent orders
-    limiter: {
-      max: 100,
-      duration: 60000, // 100 orders per minute
-    },
+    connection: redisConnection,
+    concurrency: 5,
   }
 );
 
-worker.on('completed', (job) => {
-  console.log(`✅ Job ${job.id} completed successfully`);
-});
-
-worker.on('failed', (job, err) => {
-  console.error(`❌ Job ${job?.id} failed with error:`, err.message);
-});
-
-worker.on('error', (err) => {
-  console.error('❌ Worker error:', err);
-});
-
-console.log('🚀 Worker started and listening for jobs...');
+console.log('👷 Worker: Initialized and ready');
