@@ -1,0 +1,31 @@
+{
+  "name": "order-execution-engine",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node --loader ts-node/esm src/server.ts",
+    "build": "tsc",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/websocket": "^10.0.1",
+    "@supabase/supabase-js": "^2.87.1",
+    "bullmq": "^5.1.0",
+    "dotenv": "^17.2.3",
+    "fastify": "^4.25.2",
+    "ioredis": "^5.3.2",
+    "uuid": "^9.0.1",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "@types/uuid": "^9.0.7",
+    "@types/ws": "^8.5.10",
+    "pino-pretty": "^13.1.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.1.1"
+  }
+}
