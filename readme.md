@@ -630,7 +630,6 @@ npm start
 
 ### Deployment Platforms
 
-**Recommended**: Railway, Render, or Fly.io (all offer free tiers)
 
 **Requirements**:
 - Node.js 20+
