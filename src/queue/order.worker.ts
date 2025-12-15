@@ -1,13 +1,10 @@
 import { Worker } from 'bullmq';
-import { Redis } from 'ioredis';
+import { redis } from '../queue/redis.js'; 
 import { DexRouter } from '../dex/dex.router.js';
 import { sendUpdate } from '../websocket/ws.manager.js';
 import { orderService } from '../db/order.service.js';
 import { sleep } from '../utils/sleep.js';
 
-const connection = new Redis(process.env.REDIS_URL!, {
-  maxRetriesPerRequest: null,
-});
 const dexRouter = new DexRouter();
 
 const worker = new Worker(
@@ -17,24 +14,23 @@ const worker = new Worker(
 
     try {
       console.log(`\n🔄 Processing order ${orderId} for ${tokenName}`);
-      
-      // Stage 1: PENDING (already created in route)
-      sendUpdate(orderId, { 
+
+      // Stage 1: PENDING
+      sendUpdate(orderId, {
         status: 'pending',
         orderId,
         tokenName,
-        amount 
+        amount,
       });
       await sleep(500);
 
-      // Stage 2: ROUTING - Compare DEX prices
+      // Stage 2: ROUTING
       console.log(`📡 Routing order ${orderId}...`);
       sendUpdate(orderId, { status: 'routing' });
       await orderService.updateOrderStatus(orderId, 'routing');
-      
+
       const bestDex = await dexRouter.route(tokenName, amount);
-      
-      // Update database with prices
+
       await orderService.updateOrderPrices(
         orderId,
         bestDex.raydiumPrice,
@@ -42,7 +38,7 @@ const worker = new Worker(
         bestDex.dex
       );
 
-      // Stage 3: BUILDING - Creating transaction
+      // Stage 3: BUILDING
       console.log(`🔨 Building transaction for order ${orderId} on ${bestDex.dex}...`);
       sendUpdate(orderId, {
         status: 'building',
@@ -53,29 +49,26 @@ const worker = new Worker(
         priceDifference: bestDex.priceDifference,
         priceDifferencePercent: bestDex.priceDifferencePercent,
       });
+
       await orderService.updateOrderStatus(orderId, 'building', {
         dex: bestDex.dex,
         price: bestDex.price,
       });
+
       await sleep(1000);
 
-      // Stage 4: SUBMITTED - Transaction sent to network
+      // Stage 4: SUBMITTED
       console.log(`📤 Submitting transaction for order ${orderId}...`);
       sendUpdate(orderId, { status: 'submitted' });
       await orderService.updateOrderStatus(orderId, 'submitted');
       await sleep(1500);
 
-      // Stage 5: CONFIRMED - Transaction successful
+      // Stage 5: CONFIRMED
       const txHash = `tx_${Math.random().toString(36).slice(2, 15)}`;
       const executionPrice = bestDex.effectivePrice;
-      
-      console.log(`✅ Order ${orderId} confirmed!`);
-      console.log(`   Token: ${tokenName}`);
-      console.log(`   DEX: ${bestDex.dex}`);
-      console.log(`   Price: $${executionPrice}`);
-      console.log(`   TX: ${txHash}\n`);
 
-      // Save transaction to database
+      console.log(`✅ Order ${orderId} confirmed!`);
+
       await orderService.createTransaction(
         orderId,
         bestDex.dex,
@@ -90,35 +83,34 @@ const worker = new Worker(
         dex: bestDex.dex,
       });
 
-      return { 
-        success: true, 
-        txHash, 
+      return {
+        success: true,
+        txHash,
         executionPrice,
-        dex: bestDex.dex 
+        dex: bestDex.dex,
       };
-      
     } catch (error) {
       console.error(`❌ Order ${orderId} failed:`, error);
-      
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      
-      // Mark order as failed in database
+
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+
       await orderService.markOrderFailed(orderId, errorMessage);
-      
+
       sendUpdate(orderId, {
         status: 'failed',
         error: errorMessage,
       });
-      
+
       throw error;
     }
   },
   {
-    connection,
-    concurrency: 10, // Handle up to 10 concurrent orders
+    connection: redis, // ✅ shared + TLS-enabled
+    concurrency: 10,
     limiter: {
       max: 100,
-      duration: 60000, // 100 orders per minute
+      duration: 60000,
     },
   }
 );

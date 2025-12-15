@@ -1,12 +1,8 @@
 import { Queue } from 'bullmq';
-import { Redis } from 'ioredis';
-
-const connection = new Redis(process.env.REDIS_URL!, {
-  maxRetriesPerRequest: null,
-});
+import { redis } from './redis.js';
 
 export const orderQueue = new Queue('orders', {
-  connection,
+  connection: redis,
   defaultJobOptions: {
     attempts: 3,
     backoff: {
@@ -14,11 +10,11 @@ export const orderQueue = new Queue('orders', {
       delay: 1000,
     },
     removeOnComplete: {
-      age: 3600, 
-      count: 100, 
+      age: 60 * 60, // 1 hour
+      count: 100,
     },
     removeOnFail: {
-      age: 86400, 
+      age: 24 * 60 * 60, // 24 hours
     },
   },
 });
