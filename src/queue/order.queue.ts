@@ -1,9 +1,8 @@
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 
-const connection = new Redis({
+const connection = new Redis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
 });
 
 export const orderQueue = new Queue('orders', {

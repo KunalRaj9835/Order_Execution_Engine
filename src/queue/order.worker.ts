@@ -5,9 +5,8 @@ import { sendUpdate } from '../websocket/ws.manager.js';
 import { orderService } from '../db/order.service.js';
 import { sleep } from '../utils/sleep.js';
 
-const connection = new Redis({
+const connection = new Redis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
 });
 const dexRouter = new DexRouter();
 
