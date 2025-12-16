@@ -1,8 +1,8 @@
 import { Queue } from 'bullmq';
-import { redis } from './redis.js';
+import { getRedis } from './redis.js';
 
 export const orderQueue = new Queue('orders', {
-  connection: redis,
+  connection: getRedis(),
   defaultJobOptions: {
     attempts: 3,
     backoff: {

@@ -1,5 +1,5 @@
 import { Worker } from 'bullmq';
-import { redis } from '../queue/redis.js'; 
+import { getRedis } from '../queue/redis.js';
 import { DexRouter } from '../dex/dex.router.js';
 import { sendUpdate } from '../websocket/ws.manager.js';
 import { orderService } from '../db/order.service.js';
@@ -106,7 +106,7 @@ const worker = new Worker(
     }
   },
   {
-    connection: redis, // ✅ shared + TLS-enabled
+    connection: getRedis(), // ✅ shared + TLS-enabled
     concurrency: 10,
     limiter: {
       max: 100,
