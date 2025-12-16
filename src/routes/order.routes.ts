@@ -54,33 +54,44 @@ export async function orderRoutes(app: FastifyInstance) {
     }
   });
 
-  // WebSocket endpoint for real-time updates
-  app.get('/api/orders/ws', { websocket: true }, (socket, req) => {
-    const query = req.query as any;
-    const orderId = query.orderId;
 
-    if (!orderId) {
-      socket.send(JSON.stringify({ error: 'orderId is required' }));
-      socket.close();
-      return;
+  app.route({
+    method: 'GET',
+    url: '/api/orders/ws',
+    handler: (req, reply) => {
+      // This handler is for non-WebSocket requests
+      reply.code(426).send({ 
+        error: 'This endpoint requires WebSocket connection',
+        upgrade: 'Please use WebSocket protocol'
+      });
+    },
+    wsHandler: (socket, req) => {
+      const query = req.query as any;
+      const orderId = query.orderId;
+
+      if (!orderId) {
+        socket.send(JSON.stringify({ error: 'orderId is required' }));
+        socket.close();
+        return;
+      }
+
+      console.log(`📡 WebSocket connected for order ${orderId}`);
+      registerClient(orderId, socket);
+
+      // Send initial connection confirmation
+      socket.send(JSON.stringify({ 
+        message: 'Connected to order updates',
+        orderId 
+      }));
+
+      socket.on('close', () => {
+        console.log(`📡 WebSocket disconnected for order ${orderId}`);
+      });
+
+      socket.on('error', (err) => {
+        console.error(`❌ WebSocket error for order ${orderId}:`, err);
+      });
     }
-
-    console.log(`📡 WebSocket connected for order ${orderId}`);
-    registerClient(orderId, socket);
-
-    // Send initial connection confirmation
-    socket.send(JSON.stringify({ 
-      message: 'Connected to order updates',
-      orderId 
-    }));
-
-    socket.on('close', () => {
-      console.log(`📡 WebSocket disconnected for order ${orderId}`);
-    });
-
-    socket.on('error', (err) => {
-      console.error(`❌ WebSocket error for order ${orderId}:`, err);
-    });
   });
 
   // Get order details with full history
